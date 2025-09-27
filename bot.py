@@ -1129,6 +1129,160 @@ async def export_excel(
                 receiver_name = "알 수 없음"
                 receiver_alias = "알 수 없음"
             
+            # ---- PATCH: CSV 병합 명령어 더 안전하게 ----
+@bot.tree.command(name="관리자데이터병합", description="[관리자] CSV 업로드로 계좌 잔액을 갱신합니다.")
+async def admin_import_csv(
+    interaction: discord.Interaction,
+    파일: discord.Attachment,
+    create_missing: Optional[bool] = False
+):
+    # 0) 관리자 체크
+    if not is_admin(interaction.user.id):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("관리자만 사용 가능합니다.", ephemeral=True)
+        else:
+            await interaction.followup.send("관리자만 사용 가능합니다.", ephemeral=True)
+        return
+
+    # 1) 즉시 지연응답(3초 제한 회피)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        # 이미 응답된 상태일 수 있음 → 무시
+        pass
+
+    # 2) 확장자/크기 체크
+    if not (파일.filename.lower().endswith(".csv")):
+        msg = "CSV 파일만 지원합니다. (확장자 .csv)"
+        try:
+            await interaction.followup.send(msg, ephemeral=True)
+        except Exception:
+            # 응답 토큰 만료 대비
+            pass
+        return
+
+    # 3) 파일 읽기
+    try:
+        raw = await 파일.read()
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as e:
+        err = f"파일을 읽는 중 오류가 발생했습니다: {e}"
+        try:
+            await interaction.followup.send(err, ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # 4) CSV 파싱(판다스 → 실패시 csv 모듈)
+    import io, csv as _csv
+    rows = []
+    parse_error = None
+    try:
+        df = pd.read_csv(io.StringIO(text))
+        rows = df.to_dict(orient="records")
+    except Exception as e:
+        try:
+            reader = _csv.DictReader(io.StringIO(text))
+            rows = list(reader)
+        except Exception as e2:
+            parse_error = f"CSV 파싱 실패: {e2}"
+
+    if parse_error:
+        try:
+            await interaction.followup.send(parse_error, ephemeral=True)
+        except Exception:
+            pass
+        return
+    if not rows:
+        try:
+            await interaction.followup.send("CSV에 데이터가 없습니다.", ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    # 5) 키 정규화
+    def norm_key(k: str) -> str:
+        k = (k or "").strip().lower()
+        mapping = {
+            "계좌번호": "account_number", "account_number": "account_number", "account": "account_number", "계좌": "account_number",
+            "잔액": "balance", "balance": "balance", "잔고": "balance",
+            "이름": "name", "name": "name"
+        }
+        return mapping.get(k, k)
+
+    users = load_users()
+    created = updated = skipped = 0
+    errors = []
+
+    # 6) 병합 로직
+    for idx, row in enumerate(rows, start=1):
+        try:
+            normalized = {norm_key(k): v for k, v in row.items()}
+            acc = normalized.get("account_number")
+            bal = normalized.get("balance")
+            name = normalized.get("name")
+
+            if acc is None or bal is None:
+                skipped += 1
+                continue
+
+            acc = str(acc).strip()
+            # balance 숫자화
+            try:
+                bal = int(float(str(bal).replace(",", "")))
+            except Exception:
+                skipped += 1
+                continue
+
+            if acc not in users:
+                if create_missing:
+                    users[acc] = {"이름": str(name or f"사용자({acc})"), "계좌번호": acc, "잔액": bal}
+                    created += 1
+                else:
+                    skipped += 1
+                    continue
+            else:
+                users[acc]["잔액"] = bal
+                if name:
+                    users[acc]["이름"] = str(name)
+                updated += 1
+
+        except Exception as e:
+            skipped += 1
+            errors.append(f"{idx}행 처리 실패: {e}")
+
+    # 7) 저장 및 결과 회신
+    try:
+        save_users(users)
+        embed = discord.Embed(title="📥 DB 갱신 결과", color=0x00b894)
+        embed.add_field(name="업데이트", value=f"{updated}건", inline=True)
+        embed.add_field(name="신규 생성", value=f"{created}건", inline=True)
+        embed.add_field(name="스킵", value=f"{skipped}건", inline=True)
+        if errors:
+            # 최대 5건만 표시
+            msg = "\n".join(errors[:5])
+            if len(errors) > 5:
+                msg += f"\n... 외 {len(errors) - 5}건"
+            embed.add_field(name="오류 일부", value=msg, inline=False)
+
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        # “Unknown interaction” 방지: 응답 경로 분기
+        msg = f"저장/응답 중 오류: {e}"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
+
             # 엑셀 행 데이터
             row_data = {
                 "날짜": date_str,
